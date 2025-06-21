@@ -1,80 +1,110 @@
+/**
+ * Wh32tsApp API Backend Server
+ * Entry point untuk aplikasi
+ */
+
+// Load environment variables first
+require('dotenv').config();
+
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
+const compression = require('compression');
 const rateLimit = require('express-rate-limit');
-const fs = require('fs');
 const path = require('path');
 
-// Import konfigurasi dan utils
+// Import internal modules
 const { defaultConfig } = require('./config/default');
+const { initializeDatabase, testConnection } = require('./config/database');
 const { logger } = require('./utils/logger');
+const sessionManager = require('./services/sessionManager');
+const whatsappService = require('./services/whatsappService');
 
 // Import middleware
 const {
     corsMiddleware,
-    validateContentType,
+    logRequest,
+    requestTimeout,
     errorHandler,
     notFoundHandler
 } = require('./middleware/auth');
 
-// Import routes
-const apiRoutes = require('./routes/index');
+const {
+    errorHandler: globalErrorHandler,
+    handleUncaughtException,
+    handleUnhandledRejection
+} = require('./middleware/error');
 
-// Import services
-const sessionManager = require('./services/sessionManager');
+// Import routes
+const apiRoutes = require('./routes');
 
 class WhatsAppAPIServer {
     constructor() {
         this.app = express();
         this.server = null;
-        this.setupDirectories();
-        this.setupMiddleware();
-        this.setupRoutes();
-        this.setupErrorHandling();
-        this.setupGracefulShutdown();
+        this.setupGlobalErrorHandlers();
     }
 
     /**
-     * Setup direktori yang diperlukan
+     * Setup global error handlers
      */
-    setupDirectories() {
-        const dirs = [
-            defaultConfig.session.path,
-            defaultConfig.media.uploadPath,
-            './logs',
-            './data'
-        ];
+    setupGlobalErrorHandlers() {
+        process.on('uncaughtException', handleUncaughtException);
+        process.on('unhandledRejection', handleUnhandledRejection);
 
-        dirs.forEach(dir => {
-            if (!fs.existsSync(dir)) {
-                fs.mkdirSync(dir, { recursive: true });
-                logger.info(`Directory created: ${dir}`);
+        process.on('SIGTERM', this.gracefulShutdown.bind(this));
+        process.on('SIGINT', this.gracefulShutdown.bind(this));
+    }
+
+    /**
+     * Initialize database
+     */
+    async initializeDatabase() {
+        try {
+            logger.info('Connecting to database...');
+
+            const isConnected = await testConnection();
+            if (!isConnected) {
+                throw new Error('Failed to connect to database');
             }
-        });
+
+            await initializeDatabase();
+            logger.info('Database initialized successfully');
+        } catch (error) {
+            logger.error('Database initialization failed:', error);
+            throw error;
+        }
     }
 
     /**
      * Setup middleware
      */
     setupMiddleware() {
-        // Trust proxy (untuk load balancer/reverse proxy)
-        this.app.set('trust proxy', true);
+        // Trust proxy jika di belakang proxy (nginx, cloudflare, etc)
+        if (defaultConfig.server.environment === 'production') {
+            this.app.set('trust proxy', 1);
+        }
 
         // Security middleware
         this.app.use(helmet({
-            contentSecurityPolicy: false,
+            contentSecurityPolicy: false, // Disable for API
             crossOriginEmbedderPolicy: false
         }));
 
-        // CORS
-        this.app.use(cors({
-            origin: true,
-            credentials: true,
-            methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-            allowedHeaders: ['Content-Type', 'Authorization', 'x-api-key']
-        }));
+        // Compression
+        this.app.use(compression());
 
-        // Rate limiting global
+        // CORS
+        this.app.use(corsMiddleware);
+
+        // Body parsing
+        this.app.use(express.json({ limit: '10mb' }));
+        this.app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+        // Request logging
+        this.app.use(logRequest);
+
+        // Global rate limiting
         const limiter = rateLimit({
             windowMs: defaultConfig.security.rateLimitWindowMs,
             max: defaultConfig.security.rateLimitMaxRequests,
@@ -84,191 +114,129 @@ class WhatsAppAPIServer {
                 retryAfter: Math.ceil(defaultConfig.security.rateLimitWindowMs / 1000)
             },
             standardHeaders: true,
-            legacyHeaders: false,
-            skip: (req) => {
-                // Skip rate limiting untuk health check
-                return req.path === '/health' || req.path === '/api/health';
-            }
+            legacyHeaders: false
         });
         this.app.use(limiter);
 
-        // Body parsing
-        this.app.use(express.json({
-            limit: '10mb',
-            strict: true
-        }));
-        this.app.use(express.urlencoded({
-            extended: true,
-            limit: '10mb'
-        }));
+        // Request timeout
+        this.app.use(requestTimeout(30000)); // 30 detik
 
-        // Content type validation
-        this.app.use(validateContentType);
+        // Static files untuk media
+        this.app.use('/media', express.static(path.join(__dirname, 'data/uploads')));
 
-        // Request logging
-        this.app.use((req, res, next) => {
-            const start = Date.now();
-
-            res.on('finish', () => {
-                const duration = Date.now() - start;
-                const logData = {
-                    method: req.method,
-                    url: req.originalUrl,
-                    status: res.statusCode,
-                    duration: `${duration}ms`,
-                    ip: req.ip,
-                    userAgent: req.get('User-Agent')
-                };
-
-                if (res.statusCode >= 400) {
-                    logger.warn('HTTP Request', logData);
-                } else {
-                    logger.info('HTTP Request', logData);
-                }
-            });
-
-            next();
-        });
+        logger.info('Middleware setup completed');
     }
 
     /**
      * Setup routes
      */
     setupRoutes() {
-        // Health check endpoint (tanpa auth)
+        // Health check endpoint
         this.app.get('/health', (req, res) => {
-            const uptime = process.uptime();
-            const memoryUsage = process.memoryUsage();
-            const sessions = sessionManager.getAllSessionsInfo();
+            const utilityService = require('./services/utilityService');
+            const health = utilityService.getSystemHealth();
 
-            res.json({
+            res.status(health.status === 'healthy' ? 200 : 503).json({
                 success: true,
-                message: 'WhatsApp API is running',
-                data: {
-                    status: 'healthy',
-                    uptime: `${Math.floor(uptime / 3600)}h ${Math.floor((uptime % 3600) / 60)}m ${Math.floor(uptime % 60)}s`,
-                    memory: {
-                        used: `${Math.round(memoryUsage.heapUsed / 1024 / 1024)}MB`,
-                        total: `${Math.round(memoryUsage.heapTotal / 1024 / 1024)}MB`
-                    },
-                    sessions: {
-                        total: sessions.length,
-                        connected: sessions.filter(s => s.connected).length
-                    },
-                    environment: defaultConfig.server.environment,
-                    version: '1.0.0',
-                    timestamp: new Date().toISOString()
-                }
+                message: 'Health check',
+                data: health
             });
         });
-
-        // Static files untuk QR codes dan media
-        this.app.use('/qr', express.static(path.join(__dirname, 'data/sessions')));
-        this.app.use('/media', express.static(path.join(__dirname, 'data/uploads')));
-
-        // API routes
-        this.app.use('/api', apiRoutes);
 
         // Root endpoint
         this.app.get('/', (req, res) => {
             res.json({
                 success: true,
-                message: 'Welcome to WhatsApp API',
-                data: {
-                    version: '1.0.0',
-                    environment: defaultConfig.server.environment,
-                    documentation: '/api/docs',
-                    health: '/health',
-                    endpoints: {
-                        api: '/api',
-                        auth: '/api/auth',
-                        message: '/api/message',
-                        group: '/api/group',
-                        contact: '/api/contact',
-                        status: '/api/status',
-                        webhook: '/api/webhook'
-                    },
-                    timestamp: new Date().toISOString()
-                }
+                message: 'WhatsApp API Backend',
+                version: '1.0.0',
+                timestamp: new Date().toISOString(),
+                documentation: '/api/docs',
+                health: '/health'
             });
         });
-    }
 
-    /**
-     * Setup error handling
-     */
-    setupErrorHandling() {
+        // API routes
+        this.app.use('/api', apiRoutes);
+
         // 404 handler
         this.app.use(notFoundHandler);
 
-        // Global error handler
-        this.app.use(errorHandler);
+        // Error handler
+        this.app.use(globalErrorHandler);
 
-        // Unhandled promise rejections
-        process.on('unhandledRejection', (reason, promise) => {
-            logger.error('Unhandled Rejection at:', { promise, reason });
-        });
-
-        // Uncaught exceptions
-        process.on('uncaughtException', (error) => {
-            logger.error('Uncaught Exception:', error);
-
-            // Graceful shutdown on critical errors
-            if (error.code === 'EADDRINUSE' || error.code === 'EACCES') {
-                logger.error('Critical error, shutting down...');
-                this.shutdown();
-            }
-        });
+        logger.info('Routes setup completed');
     }
 
     /**
-     * Setup graceful shutdown
+     * Load existing sessions
      */
-    setupGracefulShutdown() {
-        const shutdown = async (signal) => {
-            logger.info(`Received ${signal}, starting graceful shutdown...`);
+    async loadExistingSessions() {
+        try {
+            logger.info('Loading existing sessions...');
 
-            try {
-                // Stop accepting new connections
-                if (this.server) {
-                    this.server.close((err) => {
-                        if (err) {
-                            logger.error('Error closing server:', err);
-                        } else {
-                            logger.info('HTTP server closed');
-                        }
-                    });
-                }
+            // Load sessions dari disk
+            sessionManager.loadExistingSessions();
 
-                // Disconnect all WhatsApp sessions
-                const sessionIds = sessionManager.getAllSessionIds();
-                logger.info(`Disconnecting ${sessionIds.length} sessions...`);
+            const sessionIds = sessionManager.getAllSessionIds();
+            logger.info(`Found ${sessionIds.length} existing sessions`);
 
+            // Auto-reconnect sessions yang sebelumnya connected (optional)
+            if (process.env.AUTO_RECONNECT === 'true') {
                 for (const sessionId of sessionIds) {
                     try {
-                        const sock = sessionManager.getSession(sessionId);
-                        if (sock && sock.end) {
-                            await sock.end();
-                            logger.info(`Session ${sessionId} disconnected`);
-                        }
+                        await whatsappService.createConnection(sessionId);
+                        logger.info(`Auto-reconnecting session: ${sessionId}`);
+
+                        // Delay antar koneksi untuk menghindari rate limit
+                        await new Promise(resolve => setTimeout(resolve, 5000));
                     } catch (error) {
-                        logger.error(`Error disconnecting session ${sessionId}:`, error);
+                        logger.warn(`Failed to auto-reconnect session ${sessionId}:`, error.message);
                     }
                 }
-
-                logger.info('Graceful shutdown completed');
-                process.exit(0);
-
-            } catch (error) {
-                logger.error('Error during shutdown:', error);
-                process.exit(1);
             }
-        };
 
-        // Handle shutdown signals
-        process.on('SIGTERM', () => shutdown('SIGTERM'));
-        process.on('SIGINT', () => shutdown('SIGINT'));
-        process.on('SIGUSR2', () => shutdown('SIGUSR2')); // nodemon restart
+        } catch (error) {
+            logger.error('Error loading existing sessions:', error);
+        }
+    }
+
+    /**
+     * Setup cleanup tasks
+     */
+    setupCleanupTasks() {
+        const cron = require('node-cron');
+
+        // Cleanup sessions tidak aktif setiap hari jam 2 pagi
+        cron.schedule('0 2 * * *', () => {
+            logger.info('Running daily cleanup tasks...');
+            sessionManager.cleanupInactiveSessions();
+        });
+
+        // Cleanup old media files setiap minggu
+        cron.schedule('0 3 * * 0', async () => {
+            try {
+                const mediaService = require('./services/mediaService');
+                await mediaService.cleanupOldFiles(30); // 30 hari
+                logger.info('Old media files cleanup completed');
+            } catch (error) {
+                logger.error('Error during media cleanup:', error);
+            }
+        });
+
+        // Backup database setiap hari jam 1 pagi (jika enabled)
+        if (process.env.BACKUP_ENABLED === 'true') {
+            cron.schedule('0 1 * * *', async () => {
+                try {
+                    const { backupDatabase } = require('./config/database');
+                    await backupDatabase();
+                    logger.info('Daily database backup completed');
+                } catch (error) {
+                    logger.error('Error during database backup:', error);
+                }
+            });
+        }
+
+        logger.info('Cleanup tasks scheduled');
     }
 
     /**
@@ -276,51 +244,59 @@ class WhatsAppAPIServer {
      */
     async start() {
         try {
-            const port = defaultConfig.server.port;
+            logger.info('Starting WhatsApp API Backend...');
+            logger.info(`Environment: ${defaultConfig.server.environment}`);
+            logger.info(`Node version: ${process.version}`);
+
+            // Initialize database
+            await this.initializeDatabase();
+
+            // Setup middleware
+            this.setupMiddleware();
+
+            // Setup routes
+            this.setupRoutes();
 
             // Load existing sessions
-            logger.info('Loading existing sessions...');
-            sessionManager.loadExistingSessions();
+            await this.loadExistingSessions();
+
+            // Setup cleanup tasks
+            this.setupCleanupTasks();
 
             // Start HTTP server
+            const port = defaultConfig.server.port;
             this.server = this.app.listen(port, () => {
-                logger.info(`WhatsApp API Server started on port ${port}`);
-                logger.info(`Environment: ${defaultConfig.server.environment}`);
-                logger.info(`Health check: http://localhost:${port}/health`);
-                logger.info(`API Documentation: http://localhost:${port}/api/docs`);
-                logger.info(`Server ready to accept connections`);
+                logger.info(`🚀 Server running on port ${port}`);
+                logger.info(`📚 API Documentation: http://localhost:${port}/api/docs`);
+                logger.info(`❤️  Health Check: http://localhost:${port}/health`);
+
+                if (defaultConfig.server.environment === 'development') {
+                    logger.info(`🔧 Development mode enabled`);
+                    logger.info(`📝 Logs directory: ./logs/`);
+                    logger.info(`💾 Data directory: ./data/`);
+                }
             });
 
-            // Handle server errors
             this.server.on('error', (error) => {
-                if (error.code === 'EADDRINUSE') {
-                    logger.error(`Port ${port} is already in use`);
-                } else if (error.code === 'EACCES') {
-                    logger.error(`Permission denied to bind to port ${port}`);
-                } else {
-                    logger.error('Server error:', error);
+                if (error.syscall !== 'listen') {
+                    throw error;
                 }
-                process.exit(1);
+
+                const bind = typeof port === 'string' ? 'Pipe ' + port : 'Port ' + port;
+
+                switch (error.code) {
+                    case 'EACCES':
+                        logger.error(`${bind} requires elevated privileges`);
+                        process.exit(1);
+                        break;
+                    case 'EADDRINUSE':
+                        logger.error(`${bind} is already in use`);
+                        process.exit(1);
+                        break;
+                    default:
+                        throw error;
+                }
             });
-
-            // Setup cleanup for inactive sessions (every hour)
-            setInterval(() => {
-                logger.info('Running session cleanup...');
-                sessionManager.cleanupInactiveSessions();
-            }, 60 * 60 * 1000);
-
-            // Memory monitoring
-            setInterval(() => {
-                const memoryUsage = process.memoryUsage();
-                const memoryMB = Math.round(memoryUsage.heapUsed / 1024 / 1024);
-
-                if (memoryMB > 500) { // Alert if memory usage > 500MB
-                    logger.warn('High memory usage detected', {
-                        heapUsed: `${memoryMB}MB`,
-                        heapTotal: `${Math.round(memoryUsage.heapTotal / 1024 / 1024)}MB`
-                    });
-                }
-            }, 5 * 60 * 1000); // Check every 5 minutes
 
         } catch (error) {
             logger.error('Failed to start server:', error);
@@ -329,38 +305,62 @@ class WhatsAppAPIServer {
     }
 
     /**
-     * Manual shutdown
+     * Graceful shutdown
      */
-    async shutdown() {
-        logger.info('Manual shutdown initiated...');
-        process.emit('SIGTERM');
+    async gracefulShutdown(signal) {
+        logger.info(`Received ${signal}. Starting graceful shutdown...`);
+
+        try {
+            // Stop accepting new connections
+            if (this.server) {
+                this.server.close(() => {
+                    logger.info('HTTP server closed');
+                });
+            }
+
+            // Close all active WhatsApp sessions
+            const sessionIds = sessionManager.getAllSessionIds();
+            logger.info(`Closing ${sessionIds.length} active sessions...`);
+
+            for (const sessionId of sessionIds) {
+                try {
+                    const session = sessionManager.getSession(sessionId);
+                    if (session && session.end) {
+                        await session.end();
+                    }
+                } catch (error) {
+                    logger.warn(`Error closing session ${sessionId}:`, error.message);
+                }
+            }
+
+            // Close database connection
+            const { closeConnection } = require('./config/database');
+            await closeConnection();
+
+            logger.info('Graceful shutdown completed');
+            process.exit(0);
+
+        } catch (error) {
+            logger.error('Error during graceful shutdown:', error);
+            process.exit(1);
+        }
     }
 
     /**
-     * Get Express app instance
+     * Get application instance
      */
     getApp() {
         return this.app;
     }
-
-    /**
-     * Get server instance
-     */
-    getServer() {
-        return this.server;
-    }
 }
 
-// Create and start server
-const whatsappAPIServer = new WhatsAppAPIServer();
-
-// Start server if this file is run directly
+// Start server jika file ini dijalankan langsung
 if (require.main === module) {
-    whatsappAPIServer.start().catch(error => {
-        logger.error('Failed to start WhatsApp API Server:', error);
+    const server = new WhatsAppAPIServer();
+    server.start().catch((error) => {
+        logger.error('Failed to start application:', error);
         process.exit(1);
     });
 }
 
-// Export untuk testing atau external use
-module.exports = whatsappAPIServer;
+module.exports = WhatsAppAPIServer;a

@@ -202,8 +202,8 @@ class WhatsAppService {
         }
 
         if (connection === 'close') {
-            const shouldReconnect = (lastDisconnect?.error as Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
-            const reason = (lastDisconnect?.error as Boom)?.output?.statusCode;
+            const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+            const reason = lastDisconnect?.error?.output?.statusCode;
             const reasonText = this.getDisconnectReason(reason);
 
             logWithSession('warn', `Connection closed: ${reasonText}`, sessionId, {
